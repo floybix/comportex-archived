@@ -163,16 +163,14 @@
       others in the column to be considered dominant. And therefore to
       inhibit all other cells in the column.
 
-   * `stable-inbit-frac-threshold` - fraction of proximal input bits
-     to a layer which must be from stable cells in order to start
-     temporal pooling.
-
    * `temporal-pooling-max-exc` - maximum continuing temporal pooling
      excitation level.
 
+   * `temporal-pooling-amp` - multiplier on cell excitation to become
+     persistent temporal pooling.
+
    * `temporal-pooling-fall` - amount by which a cell's continuing
-     temporal pooling excitation falls each time step in the absence of
-     stable input.
+     temporal pooling excitation falls each time step.
 "
   {:input-dimensions [:define-me!]
    :column-dimensions [1000]
@@ -217,8 +215,8 @@
    :distal-vs-proximal-weight 0.0
    :spontaneous-activation? false
    :dominance-margin 4
-   :stable-inbit-frac-threshold 0.5
    :temporal-pooling-max-exc 50.0
+   :temporal-pooling-amp 3.0
    :temporal-pooling-fall 5.0
    :random-seed 42
    })
@@ -753,21 +751,11 @@
           ;; temporal pooling, depending on stability of input bits.
           ;; also check for clear matches, these override pooling
           higher-level? (> (:ff-max-segments spec) 1)
-          engaged? (or (not higher-level?)
-                       (> (count stable-ff-bits)
-                          (* (count ff-bits) (:stable-inbit-frac-threshold spec))))
-          newly-engaged? (or (not higher-level?)
-                             (and engaged? (not (:engaged? state))))
-          tp-exc (cond-> (if newly-engaged?
-                           {}
-                           (:temporal-pooling-exc state))
-                   true ;(not engaged?)
-                   (decay-tp (:temporal-pooling-fall spec)))
-          col-exc (cond-> raw-col-exc
-                         (not engaged?)
-                         (select-keys (keys ff-good-paths))
-                         true
-                         (columns/apply-overlap-boosting boosts))
+          fresh-context? (or (not higher-level?) (:fresh-context? state))
+          tp-exc (-> (:temporal-pooling-exc state)
+                     (decay-tp (:temporal-pooling-fall spec)))
+          col-exc (-> raw-col-exc
+                      (columns/apply-overlap-boosting boosts))
           ;; combine excitation values for selecting columns
           abs-cell-exc (total-excitations col-exc tp-exc
                                           (:distal-exc distal-state)
@@ -776,12 +764,12 @@
                                           (:depth spec))
           ;; union temporal pooling: accrete more columns as pooling continues
           activation-level (let [base-level (:activation-level spec)
-                                 prev-level (/ (count (:active-cols state))
+                                 tp-cols (distinct (map first (keys tp-exc)))
+                                 prev-level (/ (count tp-cols)
                                                (p/size-of this))]
-                             (if (or newly-engaged? (not engaged?))
-                               base-level
-                               (min (:activation-level-max spec)
-                                    (+ prev-level (* 0.5 base-level)))))
+                             (-> (+ prev-level (* 0.5 base-level))
+                                 (min (:activation-level-max spec))
+                                 (max base-level)))
           a-cols (select-active-columns (best-by-column abs-cell-exc)
                                         topology activation-level
                                         inh-radius spec)
@@ -809,7 +797,7 @@
           (select-active-cells a-cols rel-cell-exc
                                ;; definition of bursting for a column
                                (fn [col win-cell col-ac]
-                                 (if (and (not newly-engaged?)
+                                 (if (and (not fresh-context?)
                                           (= win-cell (prior-col-winners col)))
                                    ;; for continuing temporal pooling
                                    (== depth (count col-ac))
@@ -821,17 +809,20 @@
           ;; continuing winners when temporal pooling
           old-winners (vals (:col-winners state))
           new-winners (vals col-winners)
-          learning (if newly-engaged? ;; always true at first level
+          learning (if fresh-context? ;; always true at first level
                      new-winners
                      (remove (set old-winners) new-winners))
           ;; update continuing TP activation
           next-tp-exc (if higher-level?
-                        (let [new-ac (if newly-engaged?
+                        (let [new-ac (if fresh-context?
                                        ac
-                                       (set/difference ac (:active-cells state)))]
+                                       (set/difference ac (:active-cells state)))
+                              amp (:temporal-pooling-amp spec)
+                              max-exc (:temporal-pooling-max-exc spec)]
                           (into tp-exc
-                               (map vector new-ac
-                                    (repeat (:temporal-pooling-max-exc spec)))))
+                                (map (fn [[cell exc]]
+                                       [cell (-> exc (* amp) (min max-exc))]))
+                                (select-keys abs-cell-exc new-ac)))
                         {})]
       (assoc this
              :rng rng
@@ -840,8 +831,7 @@
                       :in-stable-ff-bits stable-ff-bits
                       :out-ff-bits (set (cells->bits depth ac))
                       :out-stable-ff-bits (set (cells->bits depth stable-ac))
-                      :engaged? engaged?
-                      :newly-engaged? newly-engaged?
+                      :fresh-context? false
                       :col-overlaps raw-col-exc
                       :matching-ff-seg-paths ff-seg-paths
                       :well-matching-ff-seg-paths ff-good-paths
@@ -889,19 +879,18 @@
           higher-level? (> (:ff-max-segments spec) 1)
           a-cols (:active-cols state)
           [rng* rng] (random/split rng)
-          prox-learning (when (:engaged? state)
-                          (segment-learning-map rng* (map vector a-cols (repeat 0))
-                                                (:well-matching-ff-seg-paths state)
-                                                proximal-sg
-                                                (:in-ff-bits state)
-                                                (if higher-level?
-                                                  (:in-stable-ff-bits state)
-                                                  (:in-ff-bits state))
-                                                {:pcon (:ff-perm-connected spec)
-                                                 :min-act (:ff-seg-learn-threshold spec)
-                                                 :new-syns (:ff-seg-new-synapse-count spec)
-                                                 :max-syns (:ff-seg-max-synapse-count spec)
-                                                 :max-segs (:ff-max-segments spec)}))
+          prox-learning (segment-learning-map rng* (map vector a-cols (repeat 0))
+                                              (:well-matching-ff-seg-paths state)
+                                              proximal-sg
+                                              (:in-ff-bits state)
+                                              (if higher-level?
+                                                (:in-stable-ff-bits state)
+                                                (:in-ff-bits state))
+                                              {:pcon (:ff-perm-connected spec)
+                                               :min-act (:ff-seg-learn-threshold spec)
+                                               :new-syns (:ff-seg-new-synapse-count spec)
+                                               :max-syns (:ff-seg-max-synapse-count spec)
+                                               :max-segs (:ff-max-segments spec)})
           psg (cond-> proximal-sg
                 prox-learning
                 (p/bulk-learn (vals prox-learning)
@@ -978,8 +967,7 @@
   (winner-cells [_]
     (set (vals (:col-winners state))))
   (temporal-pooling-cells [_]
-    (when (:engaged? state)
-      (keys (:temporal-pooling-exc state))))
+    (keys (:temporal-pooling-exc state)))
   (predictive-cells [_]
     (when (== (:timestep state)
               (:timestep distal-state))
@@ -995,7 +983,9 @@
     (case mode
       :tm (assoc this :distal-state
                  (assoc empty-distal-state :timestep (:timestep state)))
-      :tp (update-in this [:state :temporal-pooling-exc] empty)))
+      :tp (-> this
+              (update-in [:state :temporal-pooling-exc] empty)
+              (assoc-in [:state :fresh-context?] true))))
 
   p/PTopological
   (topology [this]
