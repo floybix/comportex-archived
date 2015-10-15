@@ -829,9 +829,8 @@
                                  tp-cols (distinct (map first (keys tp-exc)))
                                  prev-level (/ (count tp-cols)
                                                (p/size-of this))]
-                             (-> (+ prev-level (* 0.5 base-level))
-                                 (min (:activation-level-max spec))
-                                 (max base-level)))
+                             (-> (+ prev-level base-level)
+                                 (min (:activation-level-max spec))))
           a-cols (select-active-columns (best-by-column abs-cell-exc)
                                         topology activation-level
                                         inh-radius spec)
