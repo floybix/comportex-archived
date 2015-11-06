@@ -548,20 +548,16 @@
   again the unit amount is half the `:seg-learn-threshold`.
 
   Returns a map of cell ids to these relative excitation values."
-  [a-cols prior-col-winners distal-sg apical-sg distal-bits apical-bits
-   distal-apical-exc distal-min-act apical-min-act depth]
+  [a-cols prior-col-winners distal-sg distal-bits distal-exc min-act depth]
   (let [adj-base-amount (quot distal-min-act 2)]
     (->> (for [col a-cols
                :let [prior-wc (get prior-col-winners col)]
                ci (range depth)
                :let [cell-id [col ci]
-                     d-cell-segs (->> (p/cell-segments distal-sg cell-id)
-                                      (filter seq))
-                     a-cell-segs (->> (p/cell-segments apical-sg cell-id)
-                                      (filter seq))
-                     n-segs (+ (count d-cell-segs) (count a-cell-segs))]
+                     n-segs (->> (p/cell-segments distal-sg cell-id)
+                                 (filter seq))]
                :when (pos? n-segs)]
-           (let [d-exc (distal-apical-exc cell-id)]
+           (let [d-exc (distal-exc cell-id)]
              (cond
                ;; predicted cell, use distal excitation
                d-exc
@@ -570,9 +566,7 @@
                (= prior-wc cell-id)
                [cell-id adj-base-amount]
                ;; some segment matches the input even if synapses disconnected
-               (or
-                (first (best-matching-segment d-cell-segs distal-bits distal-min-act 0.0))
-                (first (best-matching-segment a-cell-segs apical-bits apical-min-act 0.0)))
+               (first (best-matching-segment d-cell-segs distal-bits min-act 0.0))
                [cell-id adj-base-amount]
                ;; there are segments but none match the input; apply penalty
                :else
@@ -903,10 +897,12 @@
                      (decay-tp (:temporal-pooling-fall spec)))
           col-exc (-> raw-col-exc
                       (columns/apply-overlap-boosting boosts))
+          ;; ignore apical excitation unless there is matching distal.
           ;; unlike other segments, allow apical excitation to add to distal
           d-a-cell-exc (if (:use-feedback? spec)
                          (merge-with + (:cell-exc distal-state)
-                                     (:cell-exc apical-state))
+                                     (select-keys (:cell-exc apical-state)
+                                                  (keys (:cell-exc distal-state))))
                          (:cell-exc distal-state))
           ;; combine excitation values for selecting columns
           abs-cell-exc (total-excitations col-exc tp-exc d-a-cell-exc
@@ -915,11 +911,12 @@
                                           (:depth spec))
           ;; union temporal pooling: accrete more columns as pooling continues
           activation-level (let [base-level (:activation-level spec)
-                                 tp-cols (distinct (map first (keys tp-exc)))
-                                 prev-level (/ (count tp-cols)
+                                 prev-level (/ (count (:active-cols state))
                                                (p/size-of this))]
-                             (-> (+ prev-level base-level)
-                                 (min (:activation-level-max spec))))
+                             (if fresh-context?
+                               base-level
+                               (-> (+ prev-level base-level)
+                                   (min (:activation-level-max spec)))))
           a-cols (select-active-columns (best-by-column abs-cell-exc)
                                         topology activation-level
                                         inh-radius spec)
@@ -931,16 +928,14 @@
           ;; * cells with inactive segments get a penalty.
           rel-cell-exc (->> (within-column-cell-exc a-cols
                                                     prior-col-winners
-                                                    distal-sg apical-sg
+                                                    distal-sg
                                                     (:on-bits distal-state)
-                                                    (:on-bits apical-state)
                                                     d-a-cell-exc
                                                     (:learn-threshold (:distal spec))
-                                                    (:learn-threshold (:apical spec))
                                                     (:depth spec))
                             (merge-with + tp-exc))
           ;; find active and winner cells in the columns
-          pc (set/union (:pred-cells distal-state) (:pred-cells apical-state))
+          pc (:pred-cells distal-state)
           depth (:depth spec)
           [rng* rng] (random/split rng)
           {ac :active-cells
@@ -1004,20 +999,20 @@
     [this]
     (let [lc (:learning-cells state)
           a-cols (:active-cols state)
+          lc-cols (map first lc) ;; only newly active cols in higher layers
           timestep (:timestep state)]
       (cond->
           (update this :state assoc
-                  :distal-learning ()
-                  :apical-learning ()
+                  :proximal-learning {}
+                  :distal-learning {}
+                  :apical-learning {}
                   :distal-punishments ()
-                  :apical-punishments ()
-                  :proximal-learning ())
+                  :apical-punishments ())
         (:learn? (:distal spec)) (layer-learn-lateral lc)
         (:learn? (:apical spec)) (layer-learn-apical lc)
         (:punish? (:distal spec)) (layer-punish-lateral)
         (:punish? (:apical spec)) (layer-punish-apical)
-        (and (:engaged? state)
-             (:learn? (:proximal spec))) (layer-learn-proximal a-cols)
+        (:learn? (:proximal spec)) (layer-learn-proximal lc-cols)
         true (update-in [:active-duty-cycles] columns/update-duty-cycles
                         (:active-cols state) (:duty-cycle-period spec))
         (zero? (mod timestep (:boost-active-every spec))) (columns/boost-active)
@@ -1067,19 +1062,16 @@
   (predictive-cells [_]
     (when (== (:timestep state)
               (:timestep distal-state))
-      (set/union (:pred-cells distal-state)
-                 (:pred-cells apical-state))))
+      (:pred-cells distal-state)))
   (prior-predictive-cells [_]
     (let [t-1 (dec (:timestep state))]
       (cond
         ;; after depolarise phase has run
         (== t-1 (:timestep prior-distal-state))
-        (set/union (:pred-cells prior-distal-state)
-                   (:pred-cells prior-apical-state))
+        (:pred-cells prior-distal-state)
         ;; before depolarise phase has run
         (== t-1 (:timestep distal-state))
-        (set/union (:pred-cells distal-state)
-                   (:pred-cells apical-state)))))
+        (:pred-cells distal-state))))
 
   p/PInterruptable
   (break [this mode]
