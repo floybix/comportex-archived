@@ -549,13 +549,14 @@
 
   Returns a map of cell ids to these relative excitation values."
   [a-cols prior-col-winners distal-sg distal-bits distal-exc min-act depth]
-  (let [adj-base-amount (quot distal-min-act 2)]
+  (let [adj-base-amount (quot min-act 2)]
     (->> (for [col a-cols
                :let [prior-wc (get prior-col-winners col)]
                ci (range depth)
                :let [cell-id [col ci]
-                     n-segs (->> (p/cell-segments distal-sg cell-id)
-                                 (filter seq))]
+                     cell-segs (->> (p/cell-segments distal-sg cell-id)
+                                    (filter seq))
+                     n-segs (count cell-segs)]
                :when (pos? n-segs)]
            (let [d-exc (distal-exc cell-id)]
              (cond
@@ -566,7 +567,7 @@
                (= prior-wc cell-id)
                [cell-id adj-base-amount]
                ;; some segment matches the input even if synapses disconnected
-               (first (best-matching-segment d-cell-segs distal-bits min-act 0.0))
+               (first (best-matching-segment cell-segs distal-bits min-act 0.0))
                [cell-id adj-base-amount]
                ;; there are segments but none match the input; apply penalty
                :else
